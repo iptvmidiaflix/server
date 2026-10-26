@@ -11,7 +11,7 @@ const admin = require('firebase-admin');
 
 const PORT = process.env.PORT || 8080;
 const ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-const TICK_MS = 100, FLUSH_MS = 3000, HB_MS = 15000, PING_MS = 25000, MAX_MSG_PER_SEC = 40, LIM = 5000;
+const TICK_MS = 50, FLUSH_MS = 3000, HB_MS = 15000, PING_MS = 25000, MAX_MSG_PER_SEC = 80, LIM = 5000;
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
 // ---------- credencial do Firebase ----------
@@ -40,7 +40,13 @@ function loadCred() {
     j.private_key = String(j.private_key).replace(/\\n/g, '\n');
     return { cert: admin.credential.cert({ projectId: j.project_id, clientEmail: j.client_email, privateKey: j.private_key }), project: j.project_id };
   }
-  if (raw && raw.trim()) throw new Error('FIREBASE_SERVICE_ACCOUNT inválido: cole o arquivo .json inteiro (de { até }).');
+  if (raw && raw.trim()) {
+    const t = raw.trim(), has = k => t.includes('"' + k + '"') ? 'sim' : 'NÃO';
+    throw new Error('FIREBASE_SERVICE_ACCOUNT inválido: cole o arquivo .json inteiro (de { até }). Diagnóstico: tamanho=' + t.length +
+      ' caracteres (o normal é ~2300), começa com "{"=' + (t[0] === '{' ? 'sim' : 'NÃO') + ', termina com "}"=' + (t[t.length - 1] === '}' ? 'sim' : 'NÃO') +
+      ', type=' + has('type') + ', project_id=' + has('project_id') + ', client_email=' + has('client_email') + ', private_key=' + has('private_key') +
+      (has('apiKey') === 'sim' ? ' | ATENÇÃO: isso parece o config do SITE (apiKey), não a chave de serviço!' : ''));
+  }
   if (process.env.RENDER) throw new Error('credencial não encontrada: crie a variável FIREBASE_SERVICE_ACCOUNT (Environment) ou o Secret File serviceAccount.json.');
   return { cert: admin.credential.applicationDefault(), project: '(Google Cloud)' };
 }
@@ -94,6 +100,7 @@ wss.on('connection', (ws, req) => {
       cl.joining = true;
       try { await join(cl, m); } catch (e) { log('join falhou:', e.message); ws.close(4003, 'auth'); }
     } else if (m.t === 'pos' && cl.room) onPos(cl, m);
+    else if (m.t === 'ping') send(ws, JSON.stringify({ t: 'pong', c: +m.c || 0 }));
   });
   ws.on('close', () => { clearTimeout(joinTimer); leave(cl); });
   ws.on('error', () => {});
@@ -148,7 +155,7 @@ function leave(cl) {
   log('leave', cl.room, cl.uid);
 }
 
-// difusão 10x/seg: um pacote por sala com quem se mexeu
+// difusão 20x/seg: um pacote por sala com quem se mexeu
 setInterval(() => {
   for (const r of rooms.values()) {
     if (!r.moved.size) continue;
