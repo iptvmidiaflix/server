@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: fypool-rt
+    runtime: node
+    rootDir: server
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /healthz
+    plan: starter   # "free" dorme após 15 min sem uso e derruba os jogadores
+    envVars:
+      - key: FIREBASE_DB_URL
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
