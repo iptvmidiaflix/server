@@ -35,10 +35,15 @@ const server = http.createServer((req, res) => {
 });
 const wss = new WebSocketServer({
   server, maxPayload: 1024,
-  verifyClient: i => !ORIGINS.length || ORIGINS.includes(i.origin)
+  verifyClient: i => {
+    const ok = !ORIGINS.length || ORIGINS.includes(i.origin);
+    if (!ok) log('origem bloqueada:', i.origin, '(permitidas:', ORIGINS.join(', ') + ')');
+    return ok;
+  }
 });
 
-wss.on('connection', ws => {
+wss.on('connection', (ws, req) => {
+  log('conexão ws aberta, origem:', req.headers.origin || '-');
   const cl = { ws, uid: null, room: null, m: '0', pos: null, joining: false, n: 0, w: Date.now() };
   ws.isAlive = true;
   const joinTimer = setTimeout(() => { if (!cl.room) ws.close(4001, 'join timeout'); }, 10000);
