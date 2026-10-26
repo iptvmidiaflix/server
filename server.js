@@ -11,11 +11,22 @@ const admin = require('firebase-admin');
 
 // Credencial: no Render, cole o JSON da conta de serviço na variável FIREBASE_SERVICE_ACCOUNT.
 // (No Google Cloud Run essa variável pode ficar vazia: usa a conta de serviço do próprio serviço.)
-const sa = process.env.FIREBASE_SERVICE_ACCOUNT;
-admin.initializeApp({
-  credential: sa ? admin.credential.cert(JSON.parse(sa)) : admin.credential.applicationDefault(),
-  databaseURL: process.env.FIREBASE_DB_URL
-});
+const sa = (process.env.FIREBASE_SERVICE_ACCOUNT || '').trim();
+const dbUrl = (process.env.FIREBASE_DB_URL || '').trim();
+let cred;
+if (sa) {
+  let j; try { j = JSON.parse(sa); } catch (e) { console.error('ERRO: FIREBASE_SERVICE_ACCOUNT não é um JSON válido (cole o arquivo inteiro, de { até }).'); process.exit(1); }
+  cred = admin.credential.cert(j);
+  console.log('Credencial: conta de serviço do projeto', j.project_id);
+} else if (process.env.RENDER) {
+  console.error('ERRO: variável FIREBASE_SERVICE_ACCOUNT não encontrada no Render (Environment). Cole o JSON da chave do Firebase.');
+  process.exit(1);
+} else {
+  cred = admin.credential.applicationDefault();
+  console.log('Credencial: applicationDefault (Google Cloud)');
+}
+if (!dbUrl) { console.error('ERRO: variável FIREBASE_DB_URL não encontrada.'); process.exit(1); }
+admin.initializeApp({ credential: cred, databaseURL: dbUrl });
 const db = admin.database();
 const TS = admin.database.ServerValue.TIMESTAMP;
 
