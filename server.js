@@ -1,52 +1,72 @@
 'use strict';
 // Servidor de movimentos em tempo real (Node.js + WebSocket) para o Render (ou Google Cloud Run).
-// - Os clientes enviam a posição por WebSocket; o servidor repassa a todos da sala (10x/seg).
-// - O Firebase fica só para persistir: a última posição de cada jogador é gravada em
-//   rooms/<sala>/lastpos/<uid> (a cada 3s, ao desconectar e ao desligar a instância).
-// - O Cloud Run derruba conexões após o timeout (máx. 60 min): o cliente reconecta sozinho
-//   e o servidor devolve a última posição no "welcome".
+// - Clientes enviam a posição por WebSocket; o servidor repassa a todos da sala (10x/seg).
+// - O Firebase só persiste: última posição em rooms/<sala>/lastpos/<uid> (a cada 3s, ao sair e ao desligar).
+// - Se a conexão cair (deploy, 60 min do Cloud Run, rede), o cliente reconecta e recebe a última posição.
+// - O servidor SEMPRE sobe (não derruba o deploy): se faltar credencial, avisa nos Logs e recusa os joins.
 const http = require('http');
+const fs = require('fs');
 const { WebSocketServer } = require('ws');
 const admin = require('firebase-admin');
-
-// Credencial: no Render, cole o JSON da conta de serviço na variável FIREBASE_SERVICE_ACCOUNT.
-// (No Google Cloud Run essa variável pode ficar vazia: usa a conta de serviço do próprio serviço.)
-let sa = (process.env.FIREBASE_SERVICE_ACCOUNT || '').trim();
-if (!sa) { // alternativa: Secret File do Render (Environment > Secret Files > serviceAccount.json)
-  for (const f of ['/etc/secrets/serviceAccount.json', process.env.FIREBASE_SERVICE_ACCOUNT_FILE]) {
-    try { if (f) { sa = require('fs').readFileSync(f, 'utf8').trim(); console.log('Credencial lida do arquivo', f); break; } } catch (e) {}
-  }
-}
-const dbUrl = (process.env.FIREBASE_DB_URL || '').trim();
-let cred;
-if (sa) {
-  let j; try { j = JSON.parse(sa); } catch (e) { console.error('ERRO: FIREBASE_SERVICE_ACCOUNT não é um JSON válido (cole o arquivo inteiro, de { até }).'); process.exit(1); }
-  cred = admin.credential.cert(j);
-  console.log('Credencial: conta de serviço do projeto', j.project_id);
-} else if (process.env.RENDER) {
-  console.error('ERRO: credencial não encontrada. Crie a variável FIREBASE_SERVICE_ACCOUNT (Environment) ou o Secret File serviceAccount.json no Render.');
-  process.exit(1);
-} else {
-  cred = admin.credential.applicationDefault();
-  console.log('Credencial: applicationDefault (Google Cloud)');
-}
-if (!dbUrl) { console.error('ERRO: variável FIREBASE_DB_URL não encontrada.'); process.exit(1); }
-admin.initializeApp({ credential: cred, databaseURL: dbUrl });
-const db = admin.database();
-const TS = admin.database.ServerValue.TIMESTAMP;
 
 const PORT = process.env.PORT || 8080;
 const ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 const TICK_MS = 100, FLUSH_MS = 3000, HB_MS = 15000, PING_MS = 25000, MAX_MSG_PER_SEC = 40, LIM = 5000;
-
-const rooms = new Map(); // sala -> { clients: Map<uid, cl>, moved: Set<uid>, dirty: Set<uid> }
 const log = (...a) => console.log(new Date().toISOString(), ...a);
+
+// ---------- credencial do Firebase ----------
+// Aceita: (1) FIREBASE_SERVICE_ACCOUNT = JSON inteiro; (2) Secret File /etc/secrets/serviceAccount.json;
+// (3) FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY; (4) credencial do Google Cloud.
+function parseCred(raw) {
+  raw = String(raw || '').trim();
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) { /* JSON quebrado por quebras de linha: tenta extrair os campos */ }
+  const f = k => { const m = raw.match(new RegExp('"' + k + '"\\s*:\\s*"([\\s\\S]*?)"\\s*[,}]')); return m ? m[1] : ''; };
+  const j = { project_id: f('project_id'), client_email: f('client_email'), private_key: f('private_key') };
+  return j.project_id && j.client_email && j.private_key ? j : null;
+}
+function loadCred() {
+  let raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (!raw || !raw.trim()) {
+    for (const f of ['/etc/secrets/serviceAccount.json', process.env.FIREBASE_SERVICE_ACCOUNT_FILE]) {
+      try { if (f && fs.existsSync(f)) { raw = fs.readFileSync(f, 'utf8'); log('Credencial lida do arquivo', f); break; } } catch (e) {}
+    }
+  }
+  let j = parseCred(raw);
+  if (!j && process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
+    j = { project_id: process.env.FIREBASE_PROJECT_ID, client_email: process.env.FIREBASE_CLIENT_EMAIL, private_key: process.env.FIREBASE_PRIVATE_KEY };
+  }
+  if (j) {
+    j.private_key = String(j.private_key).replace(/\\n/g, '\n');
+    return { cert: admin.credential.cert({ projectId: j.project_id, clientEmail: j.client_email, privateKey: j.private_key }), project: j.project_id };
+  }
+  if (raw && raw.trim()) throw new Error('FIREBASE_SERVICE_ACCOUNT inválido: cole o arquivo .json inteiro (de { até }).');
+  if (process.env.RENDER) throw new Error('credencial não encontrada: crie a variável FIREBASE_SERVICE_ACCOUNT (Environment) ou o Secret File serviceAccount.json.');
+  return { cert: admin.credential.applicationDefault(), project: '(Google Cloud)' };
+}
+
+let db = null, TS = null, initError = 'iniciando...';
+function initFirebase() {
+  try {
+    const dbUrl = (process.env.FIREBASE_DB_URL || '').trim();
+    if (!dbUrl) throw new Error('variável FIREBASE_DB_URL não encontrada (ex.: https://SEU-PROJETO-default-rtdb.firebaseio.com).');
+    const c = loadCred();
+    admin.initializeApp({ credential: c.cert, databaseURL: dbUrl });
+    db = admin.database(); TS = admin.database.ServerValue.TIMESTAMP; initError = null;
+    log('Firebase OK. Projeto:', c.project, '| banco:', dbUrl);
+  } catch (e) { initError = e.message; log('ERRO DE CONFIGURAÇÃO:', e.message); }
+}
+initFirebase();
+if (initError) setInterval(() => log('ERRO DE CONFIGURAÇÃO (o servidor está no ar, mas ninguém consegue entrar):', initError), 30000);
+
+// ---------- estado ----------
+const rooms = new Map(); // sala -> { clients: Map<uid, cl>, moved: Set<uid>, dirty: Set<uid> }
 const send = (ws, s) => { if (ws.readyState === 1) ws.send(s); };
 const arr = p => [p.x, p.y, p.z, p.yaw, p.w, p.c];
 const rec = cl => Object.assign({}, cl.pos, { m: cl.m, ts: TS });
 
 const server = http.createServer((req, res) => {
-  if (req.url === '/healthz') { res.writeHead(200); return res.end('ok'); }
+  if (req.url === '/healthz') { res.writeHead(200); return res.end(initError ? 'ok (sem firebase: ' + initError + ')' : 'ok'); }
   res.writeHead(404); res.end();
 });
 const wss = new WebSocketServer({
@@ -80,6 +100,7 @@ wss.on('connection', (ws, req) => {
 });
 
 async function join(cl, m) {
+  if (initError) throw new Error('servidor sem configuração do Firebase: ' + initError);
   const room = String(m.room || '');
   if (!/^[\w-]{1,64}$/.test(room)) throw new Error('sala inválida');
   const uid = (await admin.auth().verifyIdToken(String(m.token || ''))).uid;
@@ -93,9 +114,9 @@ async function join(cl, m) {
   let r = rooms.get(room);
   if (!r) rooms.set(room, r = { clients: new Map(), moved: new Set(), dirty: new Set() });
   const old = r.clients.get(uid);
-  // posição mais recente: memória (reconexão rápida) > Firebase (reinício/ instância nova)
+  // posição mais recente: memória (reconexão rápida) > Firebase (reinício / instância nova)
   const last = old && old.pos ? Object.assign({}, old.pos, { m: old.m }) : lp.val();
-  if (old && old !== cl) old.ws.close(4004, 'replaced'); // mesma conta em outra aba/conexão
+  if (old && old !== cl) old.ws.close(4004, 'replaced'); // mesma conta em outra aba
 
   cl.uid = uid; cl.room = room; cl.m = String(m.matchId == null ? 0 : m.matchId);
   if (last && last.m != null && String(last.m) === cl.m) cl.pos = { x: last.x, y: last.y, z: last.z, yaw: last.yaw, w: last.w || '', c: last.c ? 1 : 0 };
@@ -120,14 +141,14 @@ function leave(cl) {
   const r = cl.room && rooms.get(cl.room);
   if (!r || r.clients.get(cl.uid) !== cl) return; // conexão já substituída por outra
   r.clients.delete(cl.uid); r.moved.delete(cl.uid); r.dirty.delete(cl.uid);
-  if (cl.pos) db.ref('rooms/' + cl.room + '/lastpos/' + cl.uid).set(rec(cl)).catch(e => log('save', e.message));
+  if (cl.pos && db) db.ref('rooms/' + cl.room + '/lastpos/' + cl.uid).set(rec(cl)).catch(e => log('save', e.message));
   const msg = JSON.stringify({ t: 'left', id: cl.uid });
   for (const o of r.clients.values()) send(o.ws, msg);
   if (!r.clients.size) rooms.delete(cl.room);
   log('leave', cl.room, cl.uid);
 }
 
-// difusão 10x/seg: um único pacote por sala com quem se mexeu
+// difusão 10x/seg: um pacote por sala com quem se mexeu
 setInterval(() => {
   for (const r of rooms.values()) {
     if (!r.moved.size) continue;
@@ -141,7 +162,7 @@ setInterval(() => {
 
 // persistência no Firebase: 1 gravação por sala a cada 3s (só quem mudou)
 function flushRoom(name, r) {
-  if (!r.dirty.size) return Promise.resolve();
+  if (!db || !r.dirty.size) return Promise.resolve();
   const u = {};
   for (const uid of r.dirty) { const cl = r.clients.get(uid); if (cl && cl.pos) u[uid] = rec(cl); }
   r.dirty.clear();
@@ -149,13 +170,13 @@ function flushRoom(name, r) {
 }
 setInterval(() => { for (const [n, r] of rooms) flushRoom(n, r); }, FLUSH_MS);
 
-// keep-alive (evita conexões mortas e mantém proxies abertos)
+// keep-alive
 setInterval(() => {
   for (const ws of wss.clients) { if (!ws.isAlive) { ws.terminate(); continue; } ws.isAlive = false; ws.ping(); }
 }, PING_MS);
 setInterval(() => { const s = JSON.stringify({ t: 'hb' }); for (const ws of wss.clients) send(ws, s); }, HB_MS);
 
-// Render/Cloud Run mandam SIGTERM ao trocar/desligar a instância: salva tudo e avisa os clientes para reconectarem
+// SIGTERM (deploy/reinício): salva tudo e avisa os clientes para reconectarem
 process.on('SIGTERM', async () => {
   log('SIGTERM: salvando posições');
   await Promise.allSettled([...rooms].map(([n, r]) => { for (const [uid, cl] of r.clients) if (cl.pos) r.dirty.add(uid); return flushRoom(n, r); }));
@@ -163,5 +184,6 @@ process.on('SIGTERM', async () => {
   setTimeout(() => process.exit(0), 1500);
 });
 process.on('unhandledRejection', e => log('unhandledRejection', e && e.message));
+process.on('uncaughtException', e => log('uncaughtException', e && e.message));
 
-server.listen(PORT, () => log('rt ouvindo na porta', PORT));
+server.listen(PORT, '0.0.0.0', () => log('rt ouvindo na porta', PORT));
