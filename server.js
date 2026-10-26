@@ -11,7 +11,12 @@ const admin = require('firebase-admin');
 
 // Credencial: no Render, cole o JSON da conta de serviço na variável FIREBASE_SERVICE_ACCOUNT.
 // (No Google Cloud Run essa variável pode ficar vazia: usa a conta de serviço do próprio serviço.)
-const sa = (process.env.FIREBASE_SERVICE_ACCOUNT || '').trim();
+let sa = (process.env.FIREBASE_SERVICE_ACCOUNT || '').trim();
+if (!sa) { // alternativa: Secret File do Render (Environment > Secret Files > serviceAccount.json)
+  for (const f of ['/etc/secrets/serviceAccount.json', process.env.FIREBASE_SERVICE_ACCOUNT_FILE]) {
+    try { if (f) { sa = require('fs').readFileSync(f, 'utf8').trim(); console.log('Credencial lida do arquivo', f); break; } } catch (e) {}
+  }
+}
 const dbUrl = (process.env.FIREBASE_DB_URL || '').trim();
 let cred;
 if (sa) {
@@ -19,7 +24,7 @@ if (sa) {
   cred = admin.credential.cert(j);
   console.log('Credencial: conta de serviço do projeto', j.project_id);
 } else if (process.env.RENDER) {
-  console.error('ERRO: variável FIREBASE_SERVICE_ACCOUNT não encontrada no Render (Environment). Cole o JSON da chave do Firebase.');
+  console.error('ERRO: credencial não encontrada. Crie a variável FIREBASE_SERVICE_ACCOUNT (Environment) ou o Secret File serviceAccount.json no Render.');
   process.exit(1);
 } else {
   cred = admin.credential.applicationDefault();
