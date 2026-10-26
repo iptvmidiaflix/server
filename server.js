@@ -155,7 +155,7 @@ setInterval(() => {
 }, PING_MS);
 setInterval(() => { const s = JSON.stringify({ t: 'hb' }); for (const ws of wss.clients) send(ws, s); }, HB_MS);
 
-// Cloud Run manda SIGTERM ao trocar/desligar a instância: salva tudo e avisa os clientes para reconectarem
+// Render/Cloud Run mandam SIGTERM ao trocar/desligar a instância: salva tudo e avisa os clientes para reconectarem
 process.on('SIGTERM', async () => {
   log('SIGTERM: salvando posições');
   await Promise.allSettled([...rooms].map(([n, r]) => { for (const [uid, cl] of r.clients) if (cl.pos) r.dirty.add(uid); return flushRoom(n, r); }));
